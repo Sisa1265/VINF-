@@ -1,0 +1,7 @@
+data/wiki/*
+data/html_stranky/*
+spark-temp/*
+spark_tmp/*
+.venv311/
+.venv/
+.idea/
