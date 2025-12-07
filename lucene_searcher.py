@@ -2,9 +2,9 @@ import lucene
 from java.io import File
 from org.apache.lucene.store import FSDirectory
 from org.apache.lucene.index import DirectoryReader
-from org.apache.lucene.search import IndexSearcher
+from org.apache.lucene.search import IndexSearcher, BooleanQuery, BooleanClause, BoostQuery
 from org.apache.lucene.analysis.standard import StandardAnalyzer
-from org.apache.lucene.queryparser.classic import QueryParser
+from org.apache.lucene.util import QueryBuilder
 
 # sdresár, kde je uložený Lucene index
 # !!! musí byť rovnaký ako INDEX_DIR v indexeri, inak searcher uvidí iný / prázdny index.
@@ -27,28 +27,74 @@ def main():
     searcher = IndexSearcher(reader)
 
     # Analyzer musí byť rovnakého typu ako ten, ktorý som použila pri indexovaní
-    # (StandardAnalyzer) – aby QueryParser rovnako tokenizovat dopyty ako mám tokenizované dáta
+    # (StandardAnalyzer) – aby QueryBuilder rovnako tokenizoval dopyty ako mám tokenizované dáta
     analyzer = StandardAnalyzer()
 
     # QueryParser prekladá textový dopyt na Lucene Query objekt.
     # - podporuje syntax: field:value, "frazove dopyty", AND, OR, atď.
+    # V praxi tu použijeme QueryBuilder, ktorý nám vie vytvoriť fulltext query nad jedným poľom.
+    qb = QueryBuilder(analyzer)
 
     # kde sa ma defaultne vyhľadávať ak v dopyte nezadám konkretny field
     # default_field = "drug_name"
     # default_field = "indications"
     # default field nastavím na full_text, aby voľný text hľadal nad celým dokumentom
     default_field = "full_text"
-    parser = QueryParser(default_field, analyzer)
+
+    # váhy (boosty) pre jednotlivé polia pri VOĽNOM texte (bez "field:")
+    field_boosts = [
+        ("drug_name", 3.0),
+        ("generic_name", 3.0),
+        ("brand_names", 3.0),
+        ("wiki_tradename", 3.0),
+        ("indications", 2.0),
+        ("wiki_summary", 2.0),
+        ("full_text", 1.0),
+    ]
 
     # pomocný výpis na začiatok
     print(f"Načítaný index z: {INDEX_DIR}")
     print(f"Počet dokumentov v indexe: {reader.numDocs()}")
     print("Môžeš skúsiť napríklad:")
-    print("  aspirin")
+    print("  psoriasis")
     print("  generic_name:ibuprofen")
     print("  availability:rx-only")
-    print('  wiki_tradename:"Panadol"')
+    print('  indications:Crohn disease')
     print()
+
+    # pomocná funkcia na vytvorenie query pre jednoduchý field:hodnota dopyt
+    def build_field_query(q_text: str):
+        # Jednoduchý parser pre dopyty typu 'field:hodnota'.
+        if ":" not in q_text:
+            return None
+
+        field, value = q_text.split(":", 1)
+        field = field.strip()
+        value = value.strip()
+
+        # odstraň okolité úvodzovky, ak sú
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            value = value[1:-1]
+
+        if not field or not value:
+            return None
+
+        # QueryBuilder.createBooleanQuery(field, text) – spraví OR nad termami (podľa analyzera)
+        q = qb.createBooleanQuery(field, value)
+        return q
+
+    # pomocná funkcia: voľný text → multi-field váhovaný BooleanQuery
+    def build_weighted_multi_field_query(text: str):
+        # vytvorí BooleanQuery, ktorý hľadá text v niekoľkých poliach naraz, pričom každé pole má svoju váhu
+        builder = BooleanQuery.Builder()
+        for field, boost in field_boosts:
+            q_field = qb.createBooleanQuery(field, text)
+            if q_field is None:
+                continue
+            if boost != 1.0:
+                q_field = BoostQuery(q_field, boost)
+            builder.add(q_field, BooleanClause.Occur.SHOULD)
+        return builder.build()
 
     # slučka – čakanie na dopyty od používateľa ak nezada prazny dopyt
     # ============================================
@@ -65,14 +111,20 @@ def main():
             break
 
         try:
-            # Parsovanie dopytu -> QueryParser:
-            #   - rozbije dopyt podľa syntaxe (field:hodnota, frázy v uvodzovkách, AND/OR)
-            #   - použije analyzer na tokenizáciu (lowercase, stop words)
-            #   - vytvorí Lucene Query objekt, ktorý vie IndexSearcher spustiť
-            query = parser.parse(query_str)
+            # Rozlíšenie typu dopytu:
+            # - ak obsahuje ":", skúsime ho interpretovať ako jednoduchý field:hodnota
+            # - inak ho berieme ako voľný text nad viacerými poliami s váhami
+            if ":" in query_str:
+                query = build_field_query(query_str)
+                if query is None:
+                    # fallback: ak sa nepodarilo spraviť field query, použijem voľný text
+                    query = build_weighted_multi_field_query(query_str)
+            else:
+                query = build_weighted_multi_field_query(query_str)
+
         except Exception as e:
-            # ak dopyt nie je správny (napr. zlé úvodzovky),vypíšem chybu a spýtam sa používateľa znova
-            print("Chyba pri parsovaní dopytu:", e)
+            # ak dopyt nie je správny (napr. prázdne pole), vypíšem chybu a spýtam sa používateľa znova
+            print("Chyba pri vytváraní dopytu:", e)
             continue
 
         # searcher.search(query, k) - vráti TopDocs s k najlepšími výsledkami podľa skóre (vráti top 5)
@@ -134,43 +186,12 @@ if __name__ == "__main__":
     # ============================================
     # Príklady podporovaných typov vyhľadávania
     #
-    # 1) Voľný text (default field = "indications")
+    # 1) Voľný text (váhovaný multi-field, boostované názvy a indikácie)
     #    psoriasis
-    #    rheumatoid arthritis
-    #    "severe plaque psoriasis"
+    #    treatment options for severe plaque psoriasis with subcutaneous biologic administration
     #
-    # 2) Vyhľadávanie v konkrétnom poli (field:hodnota)
-    #      drug_name:aspirin
-    #      availability:otc
-    #      wiki_tradename:"Panadol Osteo"
-    #      wiki_synonyms:"acetylsalicylic acid"
-    #      wiki_routes:oral
-    #      side_effects:nausea
-    #
-    # 3) Frázové dopyty (uvozovky)
-    #    "chronic plaque psoriasis"
-    #    indications:"rheumatoid arthritis"
-    #    wiki_summary:"tumor necrosis factor"
-    #
-    # 4) Boolean operátory (AND, OR, NOT, +, -)
-    #      psoriasis AND subcutaneous
-    #      indications:psoriasis AND wiki_routes:subcutaneous
-    #      psoriasis OR eczema
-    #      wiki_routes:oral OR wiki_routes:topical
-    #      psoriasis NOT arthritis
-    #      psoriasis -arthritis
-    #      +psoriasis +biologic -topical
-    #
-    # 5) Wildcards (* a ?)
-    #   (ľubovoľný koniec slova):
-    #      wiki_synonyms:acetyl*
-    #      side_effects:nause*
-    #    Jednoznakové:
-    #      wiki_atc:N02BE0?
-    #
-    # 6) Kombinované multi-field dopyty
-    #    indications:psoriasis AND wiki_routes:subcutaneous AND availability:rx-only
-    #    wiki_tradename:Humira OR brand_names:Humira
-    #    generic_name:adalimumab AND wiki_pregnancy:C
-
-
+    # 2) Jednoduchý field:hodnota (cez QueryBuilder)
+    #      generic_name:ibuprofen
+    #      availability:rx-only
+    #      indications:Crohn disease
+    #      wiki_tradename:Humira
